@@ -1,0 +1,57 @@
+commands:
+  # === 고정 위치 이동 ===
+  - name: center
+    keywords: ["가운데", "중앙", "센터", "원위치", "안녕하세요", "안녕"]
+    action: "SERVO_SET"
+    servo: 0
+    angle: 90
+
+  - name: left
+    keywords: ["왼쪽", "좌측", "좌"]
+    action: "SERVO_SET"
+    servo: 0
+    angle: 30
+
+  - name: right
+    keywords: ["오른쪽", "우측", "우"]
+    action: "SERVO_SET"
+    servo: 0
+    angle: 150
+
+  # === 상대 이동 (현재 각도 기준) ===
+  - name: up
+    keywords: ["올려", "위로", "업", "up"]
+    action: "SERVO_INC"
+    servo: 0
+    value: 20
+
+  - name: down
+    keywords: ["내려", "아래로", "다운", "down"]
+    action: "SERVO_DEC"
+    servo: 0
+    value: 20
+
+  # === 동작 제어 ===
+  - name: stop
+    keywords: ["멈춰", "정지", "스탑", "stop"]
+    action: "STOP"
+    servo: 0
+
+  - name: rotate
+    keywords: ["회전", "돌아", "돌려"]
+    action: "ROTATE"
+    servo: 0
+
+  # === 숫자 직접 지정 (Regex) ===
+  # 패턴 매칭은 순서대로 검사하므로, 키워드 매칭보다 아래에 두는 것이 좋습니다.
+  - name: set_angle_explicit
+    pattern: "(\\d{1,3})\\s*도"
+    action: "SERVO_SET"
+    servo: 0
+    use_captured: true
+
+  - name: set_angle_number
+    pattern: "\\b(\\d{1,3})\\b"
+    action: "SERVO_SET"
+    servo: 0
+    use_captured: true

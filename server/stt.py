@@ -133,42 +133,78 @@ def clean_text(text: str):
     t = re.sub(r"[,，]+$", "", t).strip()
     return t
 
+
+# yaml 라이브러리 필요 (pip install pyyaml)
+import yaml
+
+ACTIONS_CONFIG = []
+
+def load_commands_config():
+    global ACTIONS_CONFIG
+    try:
+        with open("commands.yaml", "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            ACTIONS_CONFIG = data.get("commands", [])
+            log.info(f"Loaded {len(ACTIONS_CONFIG)} commands from commands.yaml")
+    except Exception as e:
+        log.error(f"Failed to load commands.yaml: {e}")
+        ACTIONS_CONFIG = []
+
 def parse_action_from_text(text: str, current_angle: int):
     t = (text or "").strip()
     if not t:
         return ({"action": "NOOP"} if UNSURE_POLICY == "NOOP" else {"action": "WIGGLE"}, False, current_angle)
 
-    angle = None
-    m = re.search(r"(\d{1,3})\s*도", t)
-    if m: angle = int(m.group(1))
-    else:
-        m2 = re.search(r"\b(\d{1,3})\b", t)
-        if m2: angle = int(m2.group(1))
+    # YAML 설정 기반 매칭
+    for cmd in ACTIONS_CONFIG:
+        matched = False
+        captured_val = None
 
-    if any(k in t for k in ["가운데", "중앙", "센터", "원위치", "안녕하세요", "안녕"]):
-        a = clamp(angle if angle is not None else DEFAULT_ANGLE_CENTER, SERVO_MIN, SERVO_MAX)
-        return ({"action": "SERVO_SET", "angle": a}, True, a)
-    if any(k in t for k in ["왼쪽", "좌측", "좌"]):
-        a = clamp(angle if angle is not None else DEFAULT_ANGLE_LEFT, SERVO_MIN, SERVO_MAX)
-        return ({"action": "SERVO_SET", "angle": a}, True, a)
-    if any(k in t for k in ["오른쪽", "우측", "우"]):
-        a = clamp(angle if angle is not None else DEFAULT_ANGLE_RIGHT, SERVO_MIN, SERVO_MAX)
-        return ({"action": "SERVO_SET", "angle": a}, True, a)
-    if any(k in t for k in ["올려", "위로", "업", "up"]):
-        step = angle if angle is not None else DEFAULT_STEP
-        a = clamp(current_angle + step, SERVO_MIN, SERVO_MAX)
-        return ({"action": "SERVO_SET", "angle": a}, True, a)
-    if any(k in t for k in ["내려", "아래로", "다운", "down"]):
-        step = angle if angle is not None else DEFAULT_STEP
-        a = clamp(current_angle - step, SERVO_MIN, SERVO_MAX)
-        return ({"action": "SERVO_SET", "angle": a}, True, a)
+        # 1. 키워드 매칭
+        if "keywords" in cmd:
+            for k in cmd["keywords"]:
+                if k in t:
+                    matched = True
+                    break
+        
+        # 2. 패턴 매칭 (키워드가 없거나 매칭 안됐을 때)
+        if not matched and "pattern" in cmd:
+            m = re.search(cmd["pattern"], t)
+            if m:
+                matched = True
+                if cmd.get("use_captured") and m.lastindex and m.lastindex >= 1:
+                    try:
+                        captured_val = int(m.group(1))
+                    except:
+                        pass
+        
+        if matched:
+            a_type = cmd.get("action", "NOOP")
+            servo_idx = cmd.get("servo", 0)
+            
+            # 값 계산
+            if a_type == "SERVO_SET":
+                angle = cmd.get("angle")
+                if cmd.get("use_captured") and captured_val is not None:
+                    angle = captured_val
+                if angle is None: angle = DEFAULT_ANGLE_CENTER
+                
+                final_angle = clamp(angle, SERVO_MIN, SERVO_MAX)
+                return ({"action": "SERVO_SET", "servo": servo_idx, "angle": final_angle}, True, final_angle)
 
-    if any(k in t for k in ["멈춰", "정지", "스탑", "stop"]):
-        return ({"action": "STOP"}, True, current_angle)
+            elif a_type == "SERVO_INC":
+                step = cmd.get("value", DEFAULT_STEP)
+                final_angle = clamp(current_angle + step, SERVO_MIN, SERVO_MAX)
+                return ({"action": "SERVO_SET", "servo": servo_idx, "angle": final_angle}, True, final_angle)
 
-    if angle is not None:
-        a = clamp(angle, SERVO_MIN, SERVO_MAX)
-        return ({"action": "SERVO_SET", "angle": a}, True, a)
+            elif a_type == "SERVO_DEC":
+                step = cmd.get("value", DEFAULT_STEP)
+                final_angle = clamp(current_angle - step, SERVO_MIN, SERVO_MAX)
+                return ({"action": "SERVO_SET", "servo": servo_idx, "angle": final_angle}, True, final_angle)
+
+            else:
+                # STOP, ROTATE 등 기타 액션
+                return ({"action": a_type, "servo": servo_idx}, True, current_angle)
 
     return ({"action": "NOOP"} if UNSURE_POLICY == "NOOP" else {"action": "WIGGLE"}, False, current_angle)
 
@@ -376,6 +412,7 @@ def handle_connection(conn, addr):
         pass
 
 def main():
+    load_commands_config()
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
