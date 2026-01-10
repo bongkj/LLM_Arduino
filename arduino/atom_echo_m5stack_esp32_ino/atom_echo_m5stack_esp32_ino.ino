@@ -8,20 +8,20 @@
 #define SERVO_PIN 25 // M5Atom Echo Grove Port (G21) - Check your wiring!
 Servo myServo;
 
-const char* SSID = "KT_GiGA_3926"; # WIFI 이름
-const char* PASS = "fbx7bef119"; # WIFI 비밀번호
+const char* SSID = "KT_GiGA_3926"; // WIFI 이름
+const char* PASS = "fbx7bef119"; // WIFI 비밀번호
 
-const char* SERVER_IP = "172.30.1.20"; # 서버 IP 주소
-const uint16_t SERVER_PORT = 5001; # 서버 포트
-WiFiClient client; # WiFi 클라이언트
+const char* SERVER_IP = "172.30.1.20"; // 서버 IP 주소
+const uint16_t SERVER_PORT = 5001; // 서버 포트
+WiFiClient client; // WiFi 클라이언트
 
-enum State { IDLE, TALKING }; # 상태
+enum State { IDLE, TALKING }; // 상태
 State state = IDLE;
-static constexpr uint8_t PTYPE_PING = 0x10; # 패킷 타입
-static uint32_t last_ping_ms = 0; # 마지막 패킷 시간
+static constexpr uint8_t PTYPE_PING = 0x10; // 패킷 타입
+static uint32_t last_ping_ms = 0; // 마지막 패킷 시간
 
-static void sendPingIfIdle() { # 패킷 전송
-  if (!client.connected()) return; # 클라이언트가 연결되어 있지 않으면 리턴
+static void sendPingIfIdle() { // 패킷 전송
+  if (!client.connected()) return; // 클라이언트가 연결되어 있지 않으면 리턴
   uint32_t now = millis();
   if (now - last_ping_ms >= 3000) {   // 3초마다
     sendPacket(PTYPE_PING, nullptr, 0);
