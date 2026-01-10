@@ -1,11 +1,15 @@
 #TODO: WiFi 이름, 비밀번호, 서버주소, 포트 등 파일로 분리하여 관리
-#TODO: 서보모듈 동작 추가
+
 
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <math.h>
 #include <string.h>
 #include <ctype.h>
+#include <ESP32Servo.h>
+
+#define SERVO_PIN 25 // M5Atom Echo Grove Port (G21) - Check your wiring!
+Servo myServo;
 
 const char* SSID = "KT_GiGA_3926"; # WIFI 이름
 const char* PASS = "fbx7bef119"; # WIFI 비밀번호
@@ -221,20 +225,39 @@ static void handleCmdJson(const uint8_t* payload, uint16_t len) {
   Serial.print("sid        : "); Serial.println(sid);
   Serial.print("meaningful : "); Serial.println(meaningful ? "true" : "false");
   Serial.print("recognized : "); Serial.println(recognized ? "true" : "false");
-  if (has_angle) {
+  if (has_angle) { 
     Serial.print("angle      : "); Serial.println(angle);
   } else {
     Serial.println("angle      : (none)");
   }
   Serial.println("===== (before robot action) =====\n");
 
-  // 🚧 여기서부터 실제 로봇 동작(서보 등)을 붙이면 됨.
-  // 지금 요청은 “동작 전에 출력”이므로 동작은 아직 구현 안 함.
-  //
-  // 예시(나중):
-  // if (!meaningful) { if (!strcmp(action,"WIGGLE")) wiggle(); return; }
-  // if (!recognized) { /* NOOP or WIGGLE */ return; }
-  // if (!strcmp(action,"SERVO_SET") && has_angle) servo_set(angle);
+  // 🚧 Robot/Servo Actions
+  // Policy: Always start 0 -> Action(max 1 time or 3sec) -> Return 0
+  if (!meaningful) {
+    if (strcmp(action, "WIGGLE") == 0) {
+      Serial.println("🤷 WIGGLE (Not meaningful)");
+    }
+  } 
+  else if (strcmp(action, "ROTATE") == 0) {
+    Serial.println("🌀 Action: ROTATE -> 3s Sweep");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 3000) {
+        myServo.write(180); delay(250);
+        myServo.write(0);   delay(250);
+    }
+    myServo.write(0); // Return to 0
+  }
+  else if (strcmp(action, "STOP") == 0) {
+    Serial.println("🛑 Action: STOP -> Return to 0");
+    myServo.write(0);
+  }
+  else if (strcmp(action, "SERVO_SET") == 0 && has_angle) {
+    Serial.printf("🔧 Action: SERVO_SET (Angle: %d) -> Hold 3s -> Return 0\n", angle);
+    myServo.write(angle);
+    delay(3000);
+    myServo.write(0);
+  }
 }
 
 static void pollServerPackets() {
@@ -317,6 +340,11 @@ void setup() {
   } else {
     Serial.println("❌ server connect failed");
   }
+
+  // Servo Init
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(0); // Initial position 0
 }
 
 void loop() {
