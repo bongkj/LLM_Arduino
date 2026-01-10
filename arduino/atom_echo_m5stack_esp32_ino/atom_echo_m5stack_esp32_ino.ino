@@ -20,6 +20,8 @@ State state = IDLE;
 static constexpr uint8_t PTYPE_PING = 0x10; // 패킷 타입
 static uint32_t last_ping_ms = 0; // 마지막 패킷 시간
 
+static void sendPacket(uint8_t type, const uint8_t* payload, uint16_t len); // Forward declaration
+
 static void sendPingIfIdle() { // 패킷 전송
   if (!client.connected()) return; // 클라이언트가 연결되어 있지 않으면 리턴
   uint32_t now = millis();
