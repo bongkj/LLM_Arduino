@@ -36,6 +36,13 @@ PTYPE_AUDIO_OUT = 0x12  # PC -> ESP32 Audio (PCM)
 
 UNSURE_POLICY = "NOOP"   # or "WIGGLE"
 
+# ===== Servo Constants =====
+SERVO_MIN = 0
+SERVO_MAX = 180
+DEFAULT_ANGLE_CENTER = 90
+DEFAULT_STEP = 20
+
+
 # ===== Logging =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("stt")
