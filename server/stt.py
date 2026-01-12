@@ -21,7 +21,7 @@ PORT = 5001
 SR = 16000
 
 # ===== 모델 설정 =====
-MODEL_SIZE = "tiny"
+MODEL_SIZE = "small"
 # PREFER_DEVICE is used for Whisper (faster-whisper)
 PREFER_DEVICE = "cuda"   # GPU 원하면 "cuda", 아니면 "cpu"
 CPU_FALLBACK_COMPUTE = "int8"

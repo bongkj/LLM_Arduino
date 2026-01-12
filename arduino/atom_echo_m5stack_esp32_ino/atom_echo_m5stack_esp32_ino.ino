@@ -114,6 +114,15 @@ static void manageConnections() {
       if (client.connect(SERVER_IP, SERVER_PORT)) {
         client.setNoDelay(true);
         Serial.println("✅ Server Connected!");
+
+        // Reset RX State to avoid desync
+        rx_stage = RX_TYPE;
+        rx_len = 0;
+        rx_pos = 0;
+        
+        // Ensure speaker is stopped so recording can proceed
+        M5.Speaker.stop();
+
         // Send a ping immediately to register
         sendPacket(PTYPE_PING, nullptr, 0);
       } else {
