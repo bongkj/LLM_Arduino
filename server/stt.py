@@ -82,12 +82,7 @@ def recv_exact(conn, n: int):
 def send_packet(conn, ptype: int, payload: bytes = b"", lock=None) -> bool:
     try:
         if payload is None: payload = b""
-        if len(payload) > 65535: # Standard max for 2byte len, actually protocol specific
-             # Simple chunking logic might be needed if really large, but for now cap it or assume logic handles it.
-             # Actually protocol says 1B type + 2B len. Max len is 65535.
-             # If audio is larger, we should split it.
-             pass 
-
+        
         def _send():
             offset = 0
             total = len(payload)
@@ -95,12 +90,38 @@ def send_packet(conn, ptype: int, payload: bytes = b"", lock=None) -> bool:
                 conn.sendall(struct.pack("<BH", ptype & 0xFF, 0))
                 return True
             
-            while offset < total:
-                chunk_size = min(total - offset, 60000) # safe margin under 65535
-                chunk = payload[offset:offset+chunk_size]
-                header = struct.pack("<BH", ptype & 0xFF, len(chunk))
-                conn.sendall(header + chunk)
-                offset += chunk_size
+            # 오디오의 경우: 샘플 경계를 맞추기 위해 int16(2바이트) 단위로 청크 분할
+            if ptype == PTYPE_AUDIO_OUT:
+                # 오디오는 int16 (2바이트) 단위이므로 짝수 바이트로 맞춤
+                # 최대 청크 크기: 약 8KB (약 0.25초 @ 16kHz) - 너무 크면 버퍼링 문제 발생 가능
+                max_chunk = 8192  # 8KB, 짝수로 유지
+                while offset < total:
+                    # 남은 데이터가 홀수 바이트면 마지막 샘플 제외
+                    remaining = total - offset
+                    if remaining < 2:
+                        break  # 마지막 홀수 바이트는 버림 (샘플 경계 맞춤)
+                    
+                    chunk_size = min(remaining, max_chunk)
+                    # 샘플 경계 맞추기: 짝수 바이트로
+                    if chunk_size % 2 != 0:
+                        chunk_size -= 1
+                    
+                    chunk = payload[offset:offset+chunk_size]
+                    header = struct.pack("<BH", ptype & 0xFF, len(chunk))
+                    conn.sendall(header + chunk)
+                    offset += chunk_size
+                    
+                    # 작은 딜레이로 네트워크 버퍼 오버플로우 방지
+                    if offset < total:
+                        time.sleep(0.001)  # 1ms 딜레이
+            else:
+                # 일반 패킷: 기존 로직 유지
+                while offset < total:
+                    chunk_size = min(total - offset, 60000) # safe margin under 65535
+                    chunk = payload[offset:offset+chunk_size]
+                    header = struct.pack("<BH", ptype & 0xFF, len(chunk))
+                    conn.sendall(header + chunk)
+                    offset += chunk_size
             return True
 
         if lock:

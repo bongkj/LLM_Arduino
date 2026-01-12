@@ -170,9 +170,10 @@ static void send_preroll() {
 static constexpr uint8_t  PTYPE_CMD = 0x11;       // PC -> ESP32
 static constexpr uint8_t  PTYPE_AUDIO_OUT = 0x12; // PC -> ESP32 Audio
 static constexpr size_t   RX_MAX_PAYLOAD = 512;   // JSON은 이 정도면 충분(넘으면 잘라서 버림)
-// Audio handling variables
-static constexpr size_t AUDIO_CHUNK_MAX = 1024; // Process audio in chunks
-static uint8_t rx_audio_buf[AUDIO_CHUNK_MAX]; 
+// Audio handling variables - 오디오는 최대 64KB까지 가능하므로 동적 할당 필요
+static constexpr size_t AUDIO_BUFFER_MAX = 32768; // 16KB (약 1초 @ 16kHz)
+static uint8_t* rx_audio_buf = nullptr;
+static size_t rx_audio_buf_size = 0; 
 
 
 enum RxStage { RX_TYPE, RX_LEN0, RX_LEN1, RX_PAYLOAD };
@@ -332,6 +333,10 @@ static void pollServerPackets() {
         rx_type = byte;
         rx_len = 0;
         rx_pos = 0;
+        // 오디오 버퍼 초기화 (새 패킷 시작)
+        if (rx_type == PTYPE_AUDIO_OUT && rx_audio_buf != nullptr) {
+          // 이전 버퍼는 유지 (재사용)
+        }
         rx_stage = RX_LEN0;
         break;
 
@@ -355,26 +360,50 @@ static void pollServerPackets() {
 
       case RX_PAYLOAD:
         if (rx_type == PTYPE_AUDIO_OUT) {
-             // Audio Streaming Mode: Don't buffer entire packet if it's huge.
-             // But here we read byte by byte.
-             // Direct Play/Buffer approach:
-             // We can collect into a small buffer and play immediately?
-             // Since M5.Speaker.playRaw copies data, we can feed it small chunks.
-             rx_audio_buf[rx_pos % AUDIO_CHUNK_MAX] = byte;
-             rx_pos++;
-             
-             if ((rx_pos % AUDIO_CHUNK_MAX) == 0) {
-                 // Buffer full, play it
-                 M5.Speaker.playRaw((const int16_t*)rx_audio_buf, AUDIO_CHUNK_MAX/2, SR, false, 1.0, false);
+             // 오디오 패킷 수신: 전체 패킷을 받은 후 재생
+             // 버퍼 할당 (필요한 경우)
+             if (rx_audio_buf == nullptr || rx_audio_buf_size < rx_len) {
+                 if (rx_audio_buf != nullptr) {
+                     free(rx_audio_buf);
+                 }
+                 rx_audio_buf_size = rx_len;
+                 rx_audio_buf = (uint8_t*)malloc(rx_audio_buf_size);
+                 if (rx_audio_buf == nullptr) {
+                     Serial.println("❌ Audio buffer alloc failed");
+                     rx_stage = RX_TYPE;
+                     break;
+                 }
              }
              
+             // 바이트 단위로 버퍼에 저장
+             if (rx_pos < rx_len) {
+                 rx_audio_buf[rx_pos] = byte;
+                 rx_pos++;
+             }
+             
+             // 패킷 완료 시 재생
              if (rx_pos >= rx_len) {
-                 // Flush remaining
-                 size_t rem = rx_pos % AUDIO_CHUNK_MAX;
-                 if (rem > 0) {
-                     M5.Speaker.playRaw((const int16_t*)rx_audio_buf, rem/2, SR, false, 1.0, false);
+                 // 샘플 수 계산 (int16 = 2바이트)
+                 size_t sample_count = rx_len / sizeof(int16_t);
+                 if (sample_count > 0 && rx_len % sizeof(int16_t) == 0) {
+                     // 큐가 가득 찬 경우 대기 (최대 100ms)
+                     uint32_t wait_start = millis();
+                     while (M5.Speaker.isPlaying() && (millis() - wait_start < 100)) {
+                         delay(1);
+                     }
+                     
+                     // M5.Speaker.playRaw는 큐를 지원하므로 연속 재생 가능
+                     // true = wait for previous to finish (큐잉)
+                     // 볼륨을 약간 낮춰서 클리핑 방지 (0.95)
+                     bool queued = M5.Speaker.playRaw((const int16_t*)rx_audio_buf, sample_count, SR, true, 0.95, false);
+                     if (!queued) {
+                         Serial.println("⚠️ Audio queue full, dropped packet");
+                     }
+                 } else {
+                     Serial.printf("⚠️ Invalid audio packet size: %d (not multiple of 2)\n", rx_len);
                  }
                  rx_stage = RX_TYPE;
+                 rx_pos = 0;
              }
         } else {
             // Normal JSON Command buffering
@@ -403,11 +432,11 @@ void setup() {
   cfg.internal_spk = true; // Speaker Enabled
   M5.begin(cfg);
 
-  // Set speaker volume to maximum
+  // Set speaker volume (200/255 = 약 78% - 클리핑 방지)
   M5.Speaker.setVolume(255);
 
   M5.Mic.setSampleRate(SR);
-
+s
   Serial.begin(115200);
 
   delay(1000); // Stabilize power
