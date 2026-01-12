@@ -1,4 +1,15 @@
 commands:
+  # === 시스템 모드 변경 ===
+  - name: switch_to_robot
+    keywords: ["로봇 모드", "수동 모드", "제어 모드"]
+    action: "SWITCH_MODE"
+    mode: "robot"
+
+  - name: switch_to_agent
+    keywords: ["에이전트 모드", "대화 모드", "채팅 모드"]
+    action: "SWITCH_MODE"
+    mode: "agent"
+
   # === 고정 위치 이동 ===
   - name: center
     keywords: ["가운데", "중앙", "센터", "원위치", "안녕하세요", "안녕"]

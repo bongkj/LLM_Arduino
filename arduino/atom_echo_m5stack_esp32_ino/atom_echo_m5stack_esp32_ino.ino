@@ -142,7 +142,12 @@ static void send_preroll() {
    ============================================================ */
 
 static constexpr uint8_t  PTYPE_CMD = 0x11;       // PC -> ESP32
+static constexpr uint8_t  PTYPE_AUDIO_OUT = 0x12; // PC -> ESP32 Audio
 static constexpr size_t   RX_MAX_PAYLOAD = 512;   // JSON은 이 정도면 충분(넘으면 잘라서 버림)
+// Audio handling variables
+static constexpr size_t AUDIO_CHUNK_MAX = 1024; // Process audio in chunks
+static uint8_t rx_audio_buf[AUDIO_CHUNK_MAX]; 
+
 
 enum RxStage { RX_TYPE, RX_LEN0, RX_LEN1, RX_PAYLOAD };
 static RxStage rx_stage = RX_TYPE;
@@ -310,19 +315,43 @@ static void pollServerPackets() {
         break;
 
       case RX_PAYLOAD:
-        // payload가 너무 길면 RX_MAX_PAYLOAD까지만 저장하고 나머지는 버림
-        if (rx_pos < RX_MAX_PAYLOAD) {
-          rx_buf[rx_pos] = byte;
-        }
-        rx_pos++;
-
-        if (rx_pos >= rx_len) {
-          // packet complete
-          if (rx_type == PTYPE_CMD) {
-            uint16_t kept = (rx_len > RX_MAX_PAYLOAD) ? RX_MAX_PAYLOAD : rx_len;
-            handleCmdJson(rx_buf, kept);
-          }
-          rx_stage = RX_TYPE;
+        if (rx_type == PTYPE_AUDIO_OUT) {
+             // Audio Streaming Mode: Don't buffer entire packet if it's huge.
+             // But here we read byte by byte.
+             // Direct Play/Buffer approach:
+             // We can collect into a small buffer and play immediately?
+             // Since M5.Speaker.playRaw copies data, we can feed it small chunks.
+             rx_audio_buf[rx_pos % AUDIO_CHUNK_MAX] = byte;
+             rx_pos++;
+             
+             if ((rx_pos % AUDIO_CHUNK_MAX) == 0) {
+                 // Buffer full, play it
+                 M5.Speaker.playRaw((const int16_t*)rx_audio_buf, AUDIO_CHUNK_MAX/2, SR, false, 1, false);
+             }
+             
+             if (rx_pos >= rx_len) {
+                 // Flush remaining
+                 size_t rem = rx_pos % AUDIO_CHUNK_MAX;
+                 if (rem > 0) {
+                     M5.Speaker.playRaw((const int16_t*)rx_audio_buf, rem/2, SR, false, 1, false);
+                 }
+                 rx_stage = RX_TYPE;
+             }
+        } else {
+            // Normal JSON Command buffering
+            if (rx_pos < RX_MAX_PAYLOAD) {
+              rx_buf[rx_pos] = byte;
+            }
+            rx_pos++;
+    
+            if (rx_pos >= rx_len) {
+              // packet complete
+              if (rx_type == PTYPE_CMD) {
+                uint16_t kept = (rx_len > RX_MAX_PAYLOAD) ? RX_MAX_PAYLOAD : rx_len;
+                handleCmdJson(rx_buf, kept);
+              }
+              rx_stage = RX_TYPE;
+            }
         }
         break;
     }
@@ -332,7 +361,7 @@ static void pollServerPackets() {
 void setup() {
   auto cfg = M5.config();
   cfg.internal_mic = true;
-  cfg.internal_spk = false;
+  cfg.internal_spk = true; // Speaker Enabled
   M5.begin(cfg);
 
   M5.Mic.setSampleRate(SR);
@@ -359,8 +388,7 @@ void setup() {
      Serial.println("\n✅ WiFi Connected!");
   } else {
      Serial.println("\n⚠️ WiFi Not Connected (will retry in loop)");
-  }
-
+  
   // Server connect will be handled in loop
 
 
@@ -377,6 +405,18 @@ void loop() {
   // ✅ (추가) 서버에서 오는 CMD 먼저 읽어서 출력
   pollServerPackets();
   sendPingIfIdle();
+
+  // If playing audio, we might want to mute Mic or pause recording?
+  // M5Atom Echo shares I2S. M5Unified handles half-duplex switching usually or we need to manage it.
+  // For Atom Echo, Mic and Speaker share I2S0? No, checking docs...
+  // Atom Echo: Mic is PDM, Speaker is I2S (NS4168). They might use same I2S port?
+  // If we try to record while playing, it leads to feedback.
+  // Ideally, if Speaker is busy, we shouldn't record or at least we should expect feedback.
+  // But for now, let's just implement receive and play.
+  if (M5.Speaker.isPlaying()) {
+      // Don't record if speaker is playing to avoid echo loop
+      return;
+  }
 
   static int16_t samples[FRAME];
   if (!M5.Mic.record(samples, FRAME)) return;

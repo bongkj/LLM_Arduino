@@ -10,6 +10,11 @@ import socket, struct, time, wave, re, logging, json, threading
 from queue import Queue, Full, Empty
 import numpy as np
 from faster_whisper import WhisperModel
+import yaml
+
+# New Modules
+from robot_mode import RobotMode
+from agent_mode import AgentMode
 
 HOST = "0.0.0.0"
 PORT = 5001
@@ -17,28 +22,31 @@ SR = 16000
 
 # ===== 모델 설정 =====
 MODEL_SIZE = "tiny"
+# PREFER_DEVICE is used for Whisper (faster-whisper)
 PREFER_DEVICE = "cuda"   # GPU 원하면 "cuda", 아니면 "cpu"
 CPU_FALLBACK_COMPUTE = "int8"
 
 # ===== Protocol =====
-PTYPE_START = 0x01
-PTYPE_AUDIO = 0x02
-PTYPE_END   = 0x03
-PTYPE_PING  = 0x10  # ESP32 keepalive
-PTYPE_CMD   = 0x11  # PC -> ESP32 JSON
+PTYPE_START     = 0x01
+PTYPE_AUDIO     = 0x02
+PTYPE_END       = 0x03
+PTYPE_PING      = 0x10  # ESP32 keepalive
+PTYPE_CMD       = 0x11  # PC -> ESP32 JSON
+PTYPE_AUDIO_OUT = 0x12  # PC -> ESP32 Audio (PCM)
 
 UNSURE_POLICY = "NOOP"   # or "WIGGLE"
-
-SERVO_MIN = 0
-SERVO_MAX = 180
-DEFAULT_ANGLE_CENTER = 90
-DEFAULT_ANGLE_LEFT = 30
-DEFAULT_ANGLE_RIGHT = 150
-DEFAULT_STEP = 20
 
 # ===== Logging =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("stt")
+
+# ===== Global State =====
+ACTIONS_CONFIG = []
+current_mode = "agent" # default mode
+
+# Helper Instances
+robot_handler = None
+agent_handler = None
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
@@ -57,13 +65,42 @@ def recv_exact(conn, n: int):
 def send_packet(conn, ptype: int, payload: bytes = b"", lock=None) -> bool:
     try:
         if payload is None: payload = b""
-        if len(payload) > 65535: payload = payload[:65535]
-        header = struct.pack("<BH", ptype & 0xFF, len(payload))
+        if len(payload) > 65535: # Standard max for 2byte len, actually protocol specific
+             # Simple chunking logic might be needed if really large, but for now cap it or assume logic handles it.
+             # Actually protocol says 1B type + 2B len. Max len is 65535.
+             # If audio is larger, we should split it.
+             pass 
+
         if lock:
             with lock:
-                conn.sendall(header + payload)
+                # If payload > 65k, we might need a loop, but let's assume caller chunks or we chunk here.
+                # Just simplified chunking for safety:
+                offset = 0
+                total = len(payload)
+                if total == 0:
+                     conn.sendall(struct.pack("<BH", ptype & 0xFF, 0))
+                     return True
+                
+                while offset < total:
+                    chunk_size = min(total - offset, 60000) # safe margin under 65535
+                    chunk = payload[offset:offset+chunk_size]
+                    header = struct.pack("<BH", ptype & 0xFF, len(chunk))
+                    conn.sendall(header + chunk)
+                    offset += chunk_size
         else:
-            conn.sendall(header + payload)
+            # Same logic without lock
+            offset = 0
+            total = len(payload)
+            if total == 0:
+                    conn.sendall(struct.pack("<BH", ptype & 0xFF, 0))
+                    return True
+            while offset < total:
+                chunk_size = min(total - offset, 60000)
+                chunk = payload[offset:offset+chunk_size]
+                header = struct.pack("<BH", ptype & 0xFF, len(chunk))
+                conn.sendall(header + chunk)
+                offset += chunk_size
+
         return True
     except Exception as e:
         log.warning(f"send_packet failed ptype=0x{ptype:02X}: {e}")
@@ -74,6 +111,13 @@ def send_action(conn: socket.socket, action_dict: dict, lock: threading.Lock):
     ok = send_packet(conn, PTYPE_CMD, payload, lock=lock)
     if ok:
         log.info(f"➡️ CMD to ESP32: {action_dict}")
+
+def send_audio(conn: socket.socket, pcm_bytes: bytes, lock: threading.Lock):
+    # Sends audio commands. 
+    # Packet type PTYPE_AUDIO_OUT will be handled by Arduino to play sound.
+    ok = send_packet(conn, PTYPE_AUDIO_OUT, pcm_bytes, lock=lock)
+    if ok:
+        log.info(f"➡️ AUDIO to ESP32: {len(pcm_bytes)} bytes")
 
 def save_wav(path: str, pcm_f32: np.ndarray, sr: int = SR):
     x = np.clip(pcm_f32, -1.0, 1.0)
@@ -133,12 +177,6 @@ def clean_text(text: str):
     t = re.sub(r"[,，]+$", "", t).strip()
     return t
 
-
-# yaml 라이브러리 필요 (pip install pyyaml)
-import yaml
-
-ACTIONS_CONFIG = []
-
 def load_commands_config():
     global ACTIONS_CONFIG
     try:
@@ -150,97 +188,34 @@ def load_commands_config():
         log.error(f"Failed to load commands.yaml: {e}")
         ACTIONS_CONFIG = []
 
-def parse_action_from_text(text: str, current_angle: int):
-    t = (text or "").strip()
-    if not t:
-        return ({"action": "NOOP"} if UNSURE_POLICY == "NOOP" else {"action": "WIGGLE"}, False, current_angle)
-
-    # YAML 설정 기반 매칭
-    for cmd in ACTIONS_CONFIG:
-        matched = False
-        captured_val = None
-
-        # 1. 키워드 매칭
-        if "keywords" in cmd:
-            for k in cmd["keywords"]:
-                if k in t:
-                    matched = True
-                    break
-        
-        # 2. 패턴 매칭 (키워드가 없거나 매칭 안됐을 때)
-        if not matched and "pattern" in cmd:
-            m = re.search(cmd["pattern"], t)
-            if m:
-                matched = True
-                if cmd.get("use_captured") and m.lastindex and m.lastindex >= 1:
-                    try:
-                        captured_val = int(m.group(1))
-                    except:
-                        pass
-        
-        if matched:
-            a_type = cmd.get("action", "NOOP")
-            servo_idx = cmd.get("servo", 0)
-            
-            # 값 계산
-            if a_type == "SERVO_SET":
-                angle = cmd.get("angle")
-                if cmd.get("use_captured") and captured_val is not None:
-                    angle = captured_val
-                if angle is None: angle = DEFAULT_ANGLE_CENTER
-                
-                final_angle = clamp(angle, SERVO_MIN, SERVO_MAX)
-                return ({"action": "SERVO_SET", "servo": servo_idx, "angle": final_angle}, True, final_angle)
-
-            elif a_type == "SERVO_INC":
-                step = cmd.get("value", DEFAULT_STEP)
-                final_angle = clamp(current_angle + step, SERVO_MIN, SERVO_MAX)
-                return ({"action": "SERVO_SET", "servo": servo_idx, "angle": final_angle}, True, final_angle)
-
-            elif a_type == "SERVO_DEC":
-                step = cmd.get("value", DEFAULT_STEP)
-                final_angle = clamp(current_angle - step, SERVO_MIN, SERVO_MAX)
-                return ({"action": "SERVO_SET", "servo": servo_idx, "angle": final_angle}, True, final_angle)
-
-            else:
-                # STOP, ROTATE 등 기타 액션
-                return ({"action": a_type, "servo": servo_idx}, True, current_angle)
-
-    return ({"action": "NOOP"} if UNSURE_POLICY == "NOOP" else {"action": "WIGGLE"}, False, current_angle)
-
-# ===== 모델 로딩 (GPU 선호하되, 터지면 CPU로 폴백) =====
+# ===== Whisper Model =====
 model_lock = threading.Lock()
 model = None
 device_in_use = None
 
-def load_model(device: str):
+def load_stt_model(device: str):
     global model, device_in_use
-    log.info(f"loading model: {MODEL_SIZE} on {device} ...")
+    log.info(f"loading STT model: {MODEL_SIZE} on {device} ...")
     m = WhisperModel(MODEL_SIZE, device=device, compute_type=("int8" if device=="cpu" else "int8"),
                      cpu_threads=1, num_workers=1)
     model = m
     device_in_use = device
-    log.info(f"model loaded on {device}")
+    log.info(f"STT model loaded on {device}")
 
-def ensure_model():
+def ensure_stt_model():
     global model
     if model is None:
         try:
-            load_model(PREFER_DEVICE)
+            load_stt_model(PREFER_DEVICE)
         except Exception as e:
             log.warning(f"GPU init failed -> fallback CPU: {e}")
-            load_model("cpu")
+            load_stt_model("cpu")
 
 def safe_transcribe(pcm_f32: np.ndarray):
-    """
-    segments(list), info 반환.
-    cublas 오류 등 GPU 런타임 오류면 CPU로 갈아타고 1회 재시도.
-    """
-    ensure_model()
+    ensure_stt_model()
     pcm_f32 = np.ascontiguousarray(pcm_f32, dtype=np.float32)
 
     def _run():
-        # generator가 나중에 터지는 걸 잡기 위해 list로 강제 평가
         segments, info = model.transcribe(
             pcm_f32,
             language="ko",
@@ -271,13 +246,15 @@ def safe_transcribe(pcm_f32: np.ndarray):
             msg = str(e)
             if "cublas64_12.dll" in msg or "cublas" in msg:
                 log.error("CUDA runtime missing/broken -> switching to CPU now.")
-                load_model("cpu")
+                load_stt_model("cpu")
                 return _run()
             raise
 
 def handle_connection(conn, addr):
+    global current_mode, robot_handler, agent_handler
+
     log.info(f"📡 connected: {addr}")
-    conn.settimeout(0.5)  # 수신 스레드가 자주 깨어나도록
+    conn.settimeout(0.5)
     try:
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except Exception:
@@ -290,16 +267,21 @@ def handle_connection(conn, addr):
     state_lock = threading.Lock()
 
     def worker():
+        global current_mode
         while True:
             job = jobs.get()
             if job is None:
                 return
             sid, data = job
             sec = len(data) / 2 / SR
+            
+            # Short audio filtering
             if sec < 0.45:
-                action = {"action": "NOOP" if UNSURE_POLICY=="NOOP" else "WIGGLE",
-                          "sid": sid, "meaningful": False, "recognized": False}
-                send_action(conn, action, send_lock)
+                # If short, maybe just ignore or send NOOP
+                if current_mode == "robot":
+                    action = {"action": "NOOP" if UNSURE_POLICY=="NOOP" else "WIGGLE",
+                              "sid": sid, "meaningful": False, "recognized": False}
+                    send_action(conn, action, send_lock)
                 continue
 
             pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -307,10 +289,11 @@ def handle_connection(conn, addr):
             log.info(f"QC sid={sid} rms={rms_db:.1f}dBFS peak={peak:.3f} clip={clip:.2f}%")
 
             if rms_db < -45.0:
-                action = {"action": "NOOP" if UNSURE_POLICY=="NOOP" else "WIGGLE",
-                          "sid": sid, "meaningful": False, "recognized": False}
-                send_action(conn, action, send_lock)
-                continue
+                 if current_mode == "robot":
+                    action = {"action": "NOOP" if UNSURE_POLICY=="NOOP" else "WIGGLE",
+                              "sid": sid, "meaningful": False, "recognized": False}
+                    send_action(conn, action, send_lock)
+                 continue
 
             pcm = trim_energy(pcm, SR)
             pcm = normalize_to_dbfs(pcm, target_dbfs=-22.0)
@@ -320,33 +303,82 @@ def handle_connection(conn, addr):
             save_wav(wav_path, pcm, SR)
             log.info(f"saved wav: {wav_path}")
 
+            text = ""
             try:
                 segments, info = safe_transcribe(pcm)
                 text = clean_text("".join(seg.text for seg in segments))
             except Exception as e:
                 log.exception(f"transcribe failed sid={sid}: {e}")
-                action = {"action": "NOOP" if UNSURE_POLICY=="NOOP" else "WIGGLE",
-                          "sid": sid, "meaningful": False, "recognized": False}
-                send_action(conn, action, send_lock)
                 continue
 
             if text:
-                log.info(f"🗣️ {text}")
+                log.info(f"🗣️ {text} (Mode: {current_mode})")
             else:
                 log.info("🗣️ (empty/filtered)")
 
             with state_lock:
                 cur = state["current_angle"]
 
-            action, meaningful, new_angle = parse_action_from_text(text, cur)
-            action["sid"] = sid
-            action["meaningful"] = meaningful
-            action["recognized"] = bool(text)
+            # 1. Check for Mode Switch first
+            # We use robot_handler's parser to check because it holds the YAML config
+            # We need to quickly check if 'SWITCH_MODE' is triggered.
+            # Using robot_handler for this is fine as it's just regex/keyword matching.
+            sys_action, meaningful, _ = robot_handler.process_text(text, cur)
+            
+            if meaningful and sys_action.get("action") == "SWITCH_MODE":
+                new_mode = sys_action.get("mode")
+                if new_mode in ["robot", "agent"]:
+                    current_mode = new_mode
+                    log.info(f"🔄 Mode Switched to: {current_mode}")
+                    
+                    # Notify user
+                    notify_text = f"{new_mode} 모드로 변경합니다."
+                    if current_mode == "agent":
+                         # Agent mode -> Speak confirmation
+                         wav_bytes = agent_handler.text_to_audio(notify_text)
+                         if wav_bytes:
+                             send_audio(conn, wav_bytes, send_lock)
+                    else:
+                        # Robot mode -> Maybe Wiggle or just accept
+                        # But we can also speak if we want "로봇 모드입니다"
+                        # For simple robot, we just act.
+                        # Using TTS for confirmation is better?
+                        # Let's try sending TTS confirmation even in Robot mode if possible,
+                        # but Robot probably expects Actions.
+                        # We will just print log for now or maybe Wiggle.
+                         action = {"action": "WIGGLE", "sid": sid}
+                         send_action(conn, action, send_lock)
+                continue
 
-            with state_lock:
-                state["current_angle"] = new_angle
+            # 2. Per Mode logic
+            if current_mode == "robot":
+                # Re-run process_text to get actual robot command if it wasn't a switch
+                # (Actually we already ran it above)
+                action = sys_action 
+                # If using sys_action from above, it's correct because robot_handler handles all commands
+                
+                action["sid"] = sid
+                action["meaningful"] = meaningful
+                action["recognized"] = bool(text)
 
-            send_action(conn, action, send_lock)
+                if meaningful and "angle" in action:
+                     with state_lock:
+                        state["current_angle"] = action["angle"]
+
+                send_action(conn, action, send_lock)
+
+            elif current_mode == "agent":
+                if not text: continue
+                # LLM Generation
+                response = agent_handler.generate_response(text)
+                if response:
+                    # TTS
+                    wav_bytes = agent_handler.text_to_audio(response)
+                    if wav_bytes:
+                        send_audio(conn, wav_bytes, send_lock)
+                    else:
+                        log.error("TTS returned empty bytes")
+
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -354,6 +386,7 @@ def handle_connection(conn, addr):
 
     while True:
         # ===== packet read =====
+        # Packet handling is same
         t = recv_exact(conn, 1)
         if t is None:
             log.info("disconnect")
@@ -375,8 +408,6 @@ def handle_connection(conn, addr):
 
         # ===== handle =====
         if ptype == PTYPE_PING:
-            # keepalive. 필요하면 pong도 가능:
-            # send_packet(conn, PTYPE_PING, b"", lock=send_lock)
             continue
 
         if ptype == PTYPE_START:
@@ -388,7 +419,6 @@ def handle_connection(conn, addr):
 
         elif ptype == PTYPE_AUDIO:
             audio_buf.extend(payload)
-            # 너무 길면 안전 컷
             if len(audio_buf) > int(12 * SR * 2):
                 log.warning("buffer too large -> force END")
                 ptype = PTYPE_END
@@ -412,11 +442,25 @@ def handle_connection(conn, addr):
         pass
 
 def main():
+    global robot_handler, agent_handler
+    
+    # Load Commands
     load_commands_config()
+    
+    # Init Handlers
+    robot_handler = RobotMode(ACTIONS_CONFIG)
+    agent_handler = AgentMode(PREFER_DEVICE)
+    
+    # Pre-load models? WHisper loads on first call or ensure_stt
+    # Agent LLM load:
+    agent_handler.load_model()
+    
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
     srv.listen(5)
+
+    log.info(f"Server started on {PORT}. Default Mode: {current_mode}")
 
     while True:
         log.info("ready for next connection...")
@@ -437,7 +481,6 @@ def main():
             try: conn.close()
             except Exception: pass
             log.info(f"🔌 disconnected: {addr}")
-            # Ensure we don't spin too fast if something is broken
             time.sleep(0.1)
 
 if __name__ == "__main__":
